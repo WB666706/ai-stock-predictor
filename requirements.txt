@@ -1,0 +1,6 @@
+streamlit>=1.36
+akshare>=1.14
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.4
+plotly>=5.20
