@@ -120,13 +120,24 @@ def fetch_history(symbol: str, years: int = 3, adjust: str = "qfq") -> pd.DataFr
 
 
 def fetch_stock_name(symbol: str) -> str:
-    """获取股票名称，失败时返回代码本身（不影响主流程）。"""
+    """获取股票名称，东财失败时改用腾讯行情接口，再失败返回代码本身。"""
     symbol = normalize_symbol(symbol)
     try:
         info = ak.stock_individual_info_em(symbol=symbol)
         row = info.loc[info["item"] == "股票简称", "value"]
         if not row.empty:
             return str(row.iloc[0])
+    except Exception:
+        pass
+    try:
+        r = requests.get(
+            f"https://qt.gtimg.cn/q={market_prefix(symbol)}{symbol}", timeout=5
+        )
+        r.encoding = "gbk"
+        # 返回格式：v_sh600519="1~贵州茅台~600519~..."
+        fields = r.text.split("~")
+        if len(fields) > 2 and fields[1].strip():
+            return fields[1].strip()
     except Exception:
         pass
     return symbol

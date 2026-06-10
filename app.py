@@ -1,4 +1,4 @@
-"""AI 股票预测 · A 股行情分析与机器学习走势预测（Streamlit 应用）。
+"""AI 股票预测 Pro · A 股行情分析、智能诊断、机器学习预测与策略回测。
 
 运行方式：streamlit run app.py
 """
@@ -10,15 +10,35 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from core import backtest as bt_mod
 from core import data as data_mod
-from core import indicators, model as model_mod
+from core import indicators, news as news_mod
+from core import model as model_mod
+from core import signals as signals_mod
 
-st.set_page_config(page_title="AI 股票预测", page_icon="📈", layout="wide")
+st.set_page_config(page_title="AI 股票预测 Pro", page_icon="📈", layout="wide")
 
 UP, DOWN = "#f23645", "#089981"  # A 股习惯：红涨绿跌
+ACCENT, GOLD = "#6c8cff", "#f5b942"
+
+st.markdown(
+    """
+    <style>
+    div[data-testid="stMetric"] {
+        background: linear-gradient(135deg, rgba(108,140,255,0.08), rgba(108,140,255,0.02));
+        border: 1px solid rgba(108,140,255,0.25);
+        border-radius: 12px;
+        padding: 12px 16px;
+    }
+    div[data-testid="stMetric"] label { color: #8b97a7; }
+    button[data-baseweb="tab"] { font-size: 15px; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-# ---------- 数据缓存 ----------
+# ---------- 数据与计算缓存 ----------
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_history(symbol: str, years: int) -> pd.DataFrame:
@@ -26,14 +46,45 @@ def load_history(symbol: str, years: int) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
+def _load_name_cached(symbol: str) -> str:
+    name = data_mod.fetch_stock_name(symbol)
+    if name == symbol:
+        # 抛异常以避免把「获取失败」缓存一整天，下次重试
+        raise LookupError(symbol)
+    return name
+
+
 def load_name(symbol: str) -> str:
-    return data_mod.fetch_stock_name(symbol)
+    try:
+        return _load_name_cached(symbol)
+    except Exception:
+        return symbol
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def run_forecast(df: pd.DataFrame, horizon: int, kind: str):
+    return model_mod.train_and_forecast(df, horizon=horizon, model_kind=kind)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def run_replay(df: pd.DataFrame, kind: str) -> pd.DataFrame:
+    return model_mod.walk_forward_replay(df, model_kind=kind)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def run_backtest(df: pd.DataFrame, kind: str, threshold: float, cost: float):
+    return bt_mod.run_backtest(df, model_kind=kind, threshold=threshold, cost=cost)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def load_news(symbol: str) -> pd.DataFrame:
+    return news_mod.fetch_news(symbol)
 
 
 # ---------- 侧边栏 ----------
 
 with st.sidebar:
-    st.title("📈 AI 股票预测")
+    st.title("📈 AI 股票预测 Pro")
     symbol_input = st.text_input("股票代码", value="600519", help="6 位 A 股代码，如 600519（贵州茅台）、000001（平安银行）")
     years = st.select_slider("历史数据范围（年）", options=[1, 2, 3, 5, 8], value=3)
     horizon = st.slider("预测天数（交易日）", min_value=3, max_value=30, value=10)
@@ -43,14 +94,12 @@ with st.sidebar:
     st.divider()
     st.caption(
         "⚠️ 本项目仅用于学习机器学习与量化分析技术，"
-        "预测结果不构成任何投资建议。股市有风险，入市需谨慎。"
+        "预测与回测结果不构成任何投资建议。股市有风险，入市需谨慎。"
     )
 
 if not run and "df" not in st.session_state:
     st.info("👈 在左侧输入股票代码，点击「开始分析」")
     st.stop()
-
-# ---------- 加载数据 ----------
 
 if run:
     try:
@@ -59,6 +108,8 @@ if run:
             df = load_history(symbol, years)
             name = load_name(symbol)
         st.session_state.update(df=df, name=name, symbol=symbol, horizon=horizon, model_label=model_label)
+        st.session_state.pop("bt_result", None)  # 切换股票后清除旧回测与对比
+        st.session_state.pop("cmp_data", None)
     except Exception as e:
         st.error(f"数据获取失败：{e}")
         st.stop()
@@ -68,6 +119,7 @@ name: str = st.session_state["name"]
 symbol: str = st.session_state["symbol"]
 horizon = st.session_state["horizon"]
 model_label = st.session_state["model_label"]
+model_kind = model_mod.MODEL_CHOICES[model_label]
 
 dfi = indicators.add_all(df)
 
@@ -85,11 +137,14 @@ c4.metric("区间最高", f"{df['high'].max():.2f}")
 c5.metric("区间最低", f"{df['low'].min():.2f}")
 st.caption(f"数据范围：{df['date'].iloc[0]:%Y-%m-%d} ～ {df['date'].iloc[-1]:%Y-%m-%d}，前复权日线，共 {len(df)} 个交易日")
 
-tab_k, tab_ind, tab_ai = st.tabs(["🕯️ K 线与均线", "📊 技术指标", "🤖 AI 预测"])
+tab_k, tab_ind, tab_diag, tab_ai, tab_bt, tab_cmp, tab_news = st.tabs(
+    ["🕯️ K 线与均线", "📊 技术指标", "🧭 智能诊断", "🤖 AI 预测", "⚖️ 策略回测", "🆚 多股对比", "📰 个股资讯"]
+)
 
 # ---------- K 线 ----------
 
 with tab_k:
+    show_cross = st.checkbox("标注 MACD 金叉 ▲ / 死叉 ▼", value=True)
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
     fig.add_trace(
         go.Candlestick(
@@ -99,9 +154,25 @@ with tab_k:
         ),
         row=1, col=1,
     )
-    for w, color in [(5, "#f5b942"), (20, "#42a5f5"), (60, "#ab47bc")]:
+    for w, color in [(5, GOLD), (20, "#42a5f5"), (60, "#ab47bc")]:
         fig.add_trace(
             go.Scatter(x=dfi["date"], y=dfi[f"ma{w}"], name=f"MA{w}", line=dict(width=1.2, color=color)),
+            row=1, col=1,
+        )
+    if show_cross:
+        golden, death = signals_mod.find_macd_crosses(dfi)
+        fig.add_trace(
+            go.Scatter(
+                x=golden["date"], y=golden["low"] * 0.985, mode="markers", name="MACD 金叉",
+                marker=dict(symbol="triangle-up", size=11, color=UP),
+            ),
+            row=1, col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=death["date"], y=death["high"] * 1.015, mode="markers", name="MACD 死叉",
+                marker=dict(symbol="triangle-down", size=11, color=DOWN),
+            ),
             row=1, col=1,
         )
     vol_colors = [UP if c >= o else DOWN for c, o in zip(dfi["close"], dfi["open"])]
@@ -142,7 +213,7 @@ with tab_ind:
     with col_r:
         st.markdown("**RSI（14 日）**")
         fig = go.Figure()
-        fig.add_scatter(x=dfi["date"], y=dfi["rsi14"], name="RSI14", line=dict(width=1.2, color="#f5b942"))
+        fig.add_scatter(x=dfi["date"], y=dfi["rsi14"], name="RSI14", line=dict(width=1.2, color=GOLD))
         fig.add_hline(y=70, line_dash="dot", line_color=UP, annotation_text="超买 70")
         fig.add_hline(y=30, line_dash="dot", line_color=DOWN, annotation_text="超卖 30")
         fig.update_layout(height=300, margin=dict(t=10, b=10), yaxis_range=[0, 100])
@@ -160,13 +231,52 @@ with tab_ind:
         fig.update_layout(height=300, margin=dict(t=10, b=10), legend=dict(orientation="h"))
         st.plotly_chart(fig, use_container_width=True)
 
+# ---------- 智能诊断 ----------
+
+with tab_diag:
+    diag = signals_mod.diagnose(df)
+
+    col_score, col_items = st.columns([1, 1.6])
+    with col_score:
+        color = UP if diag.score >= 55 else (DOWN if diag.score <= 45 else GOLD)
+        fig = go.Figure(
+            go.Indicator(
+                mode="gauge+number",
+                value=diag.score,
+                number={"suffix": " 分"},
+                title={"text": f"技术面综合评分 · <b>{diag.verdict}</b>"},
+                gauge={
+                    "axis": {"range": [0, 100]},
+                    "bar": {"color": color},
+                    "steps": [
+                        {"range": [0, 30], "color": "rgba(8,153,129,0.25)"},
+                        {"range": [30, 45], "color": "rgba(8,153,129,0.12)"},
+                        {"range": [45, 55], "color": "rgba(150,150,150,0.15)"},
+                        {"range": [55, 70], "color": "rgba(242,54,69,0.12)"},
+                        {"range": [70, 100], "color": "rgba(242,54,69,0.25)"},
+                    ],
+                },
+            )
+        )
+        fig.update_layout(height=320, margin=dict(t=60, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("评分基于最新交易日的 7 维技术信号加权汇总：50 为中性，越高越偏多。")
+
+    with col_items:
+        rows = []
+        for item in diag.items:
+            icon = {"多": "🔴 偏多", "空": "🟢 偏空", "中性": "⚪ 中性"}[item.verdict]
+            rows.append({"指标": item.name, "当前状态": item.state, "信号": icon, "评分影响": f"{item.delta:+d}"})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=330)
+
+    st.info("💡 信号颜色遵循 A 股习惯：红=偏多（看涨），绿=偏空（看跌）。评分为统计性参考，不构成投资建议。")
+
 # ---------- AI 预测 ----------
 
 with tab_ai:
-    model_kind = model_mod.MODEL_CHOICES[model_label]
     try:
         with st.spinner(f"正在训练 {model_label} 模型并预测…"):
-            result = model_mod.train_and_forecast(df, horizon=horizon, model_kind=model_kind)
+            result = run_forecast(df, horizon, model_kind)
     except Exception as e:
         st.error(f"模型训练失败：{e}")
         st.stop()
@@ -189,11 +299,9 @@ with tab_ai:
     m3.metric("次日收益率 MAE", f"{result.mae * 100:.2f}%")
     m4.metric("训练样本数", f"{result.n_samples}")
 
-    # 历史价格（最近 120 日）+ 预测曲线与置信区间
     hist = df.tail(120)
     fig = go.Figure()
     fig.add_scatter(x=hist["date"], y=hist["close"], name="历史收盘价", line=dict(color="#42a5f5", width=1.6))
-
     bridge_x = [hist["date"].iloc[-1], *fc["date"]]
     fig.add_scatter(
         x=bridge_x, y=[hist["close"].iloc[-1], *fc["upper"]],
@@ -205,9 +313,9 @@ with tab_ai:
     )
     fig.add_scatter(
         x=bridge_x, y=[hist["close"].iloc[-1], *fc["price"]],
-        name="AI 预测价", line=dict(color="#f5b942", width=2, dash="dash"), mode="lines+markers",
+        name="AI 预测价", line=dict(color=GOLD, width=2, dash="dash"), mode="lines+markers",
     )
-    fig.update_layout(height=460, hovermode="x unified", legend=dict(orientation="h"), margin=dict(t=30, b=10))
+    fig.update_layout(height=440, hovermode="x unified", legend=dict(orientation="h"), margin=dict(t=30, b=10))
     st.plotly_chart(fig, use_container_width=True)
 
     col_t, col_i = st.columns([1.2, 1])
@@ -220,17 +328,189 @@ with tab_ai:
             columns={"date": "日期", "price": "预测价", "lower": "下界", "upper": "上界", "cum_return": "累计涨跌幅"}
         )
         st.dataframe(show.round(2), use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ 导出预测结果 CSV",
+            show.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{symbol}_forecast.csv",
+            mime="text/csv",
+        )
 
     with col_i:
         if result.feature_importance is not None:
             st.markdown("**特征重要性 Top 10**")
             imp = result.feature_importance.head(10).iloc[::-1]
-            fig = go.Figure(go.Bar(x=imp.values, y=imp.index, orientation="h", marker_color="#6c8cff"))
+            fig = go.Figure(go.Bar(x=imp.values, y=imp.index, orientation="h", marker_color=ACCENT))
             fig.update_layout(height=380, margin=dict(t=10, b=10, l=10))
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("当前模型不提供特征重要性（融合/神经网络/线性模型）。")
+
+    st.markdown("---")
+    st.markdown("**🔁 模型可信度检验：历史预测 vs 实际走势（滚动回放）**")
+    st.caption("模拟「每天只用当天之前的数据训练模型」，逐日预测次日收盘价并与实际对比——这是模型真实水平的试金石。")
+    try:
+        with st.spinner("正在滚动回放历史预测…"):
+            replay = run_replay(df, model_kind)
+        hit = float((replay["pred_ret"] * replay["actual_ret"] > 0).mean())
+        r1, r2 = st.columns([3, 1])
+        with r1:
+            fig = go.Figure()
+            fig.add_scatter(x=replay["date"], y=replay["actual"], name="实际收盘价", line=dict(color="#42a5f5", width=1.6))
+            fig.add_scatter(x=replay["date"], y=replay["predicted"], name="当日模型预测", line=dict(color=GOLD, width=1.4, dash="dot"))
+            fig.update_layout(height=360, hovermode="x unified", legend=dict(orientation="h"), margin=dict(t=20, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        with r2:
+            st.metric("回放区间方向命中率", f"{hit * 100:.1f}%")
+            st.metric("回放天数", f"{len(replay)}")
+            mae_replay = float((replay["pred_ret"] - replay["actual_ret"]).abs().mean())
+            st.metric("收益率 MAE", f"{mae_replay * 100:.2f}%")
+    except Exception as e:
+        st.warning(f"滚动回放失败：{e}")
 
     st.warning(
         "📢 **免责声明**：以上预测基于历史技术面数据的统计规律，无法预知突发消息、政策与基本面变化。"
         "股价短期走势接近随机游走，任何模型的预测都存在很大不确定性。"
         "本工具仅供学习参考，切勿作为实际投资依据。"
     )
+
+# ---------- 策略回测 ----------
+
+with tab_bt:
+    st.markdown("**模型信号策略**：滚动训练（不使用未来数据），预测次日收益为正则持仓、否则空仓，与「买入持有」对比。")
+    p1, p2, p3 = st.columns(3)
+    threshold = p1.number_input("开仓阈值（预测次日收益 >）", value=0.0, step=0.001, format="%.3f")
+    cost = p2.number_input("单边交易成本", value=0.001, step=0.0005, format="%.4f", help="含佣金与冲击成本，0.001 = 0.1%")
+    p3.markdown(" ")
+    do_bt = p3.button("🚀 运行回测（最近一年）", use_container_width=True)
+
+    if do_bt:
+        try:
+            with st.spinner("正在滚动训练并回测（约 10-60 秒）…"):
+                st.session_state["bt_result"] = run_backtest(df, model_kind, threshold, cost)
+        except Exception as e:
+            st.error(f"回测失败：{e}")
+
+    bt = st.session_state.get("bt_result")
+    if bt is not None:
+        m = bt.metrics
+        b1, b2, b3, b4, b5 = st.columns(5)
+        b1.metric("策略总收益", f"{m['策略总收益'] * 100:+.1f}%", f"持有 {m['买入持有总收益'] * 100:+.1f}%", delta_color="off")
+        b2.metric("策略年化", f"{m['策略年化收益'] * 100:+.1f}%", f"持有 {m['买入持有年化'] * 100:+.1f}%", delta_color="off")
+        b3.metric("最大回撤", f"{m['策略最大回撤'] * 100:.1f}%", f"持有 {m['买入持有最大回撤'] * 100:.1f}%", delta_color="off")
+        b4.metric("夏普比率", f"{m['夏普比率']:.2f}")
+        b5.metric("持仓日胜率", f"{m['持仓日胜率'] * 100:.1f}%", f"换仓 {bt.n_trades} 次", delta_color="off")
+
+        eq = bt.equity
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.78, 0.22], vertical_spacing=0.04)
+        fig.add_scatter(x=eq["date"], y=(eq["strategy"] - 1) * 100, name="模型信号策略", line=dict(color=GOLD, width=2), row=1, col=1)
+        fig.add_scatter(x=eq["date"], y=(eq["buy_hold"] - 1) * 100, name="买入持有", line=dict(color="#42a5f5", width=1.6), row=1, col=1)
+        fig.add_scatter(
+            x=eq["date"], y=eq["position"], name="仓位（1=持仓）",
+            line=dict(color=ACCENT, width=1), fill="tozeroy", fillcolor="rgba(108,140,255,0.18)", row=2, col=1,
+        )
+        fig.update_yaxes(title_text="累计收益 %", row=1, col=1)
+        fig.update_yaxes(range=[-0.05, 1.1], row=2, col=1)
+        fig.update_layout(height=520, hovermode="x unified", legend=dict(orientation="h"), margin=dict(t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("回测期为最近约 250 个交易日；每 20 个交易日用截至当日的数据重新训练模型，全程无未来数据泄漏。")
+    else:
+        st.info("设置参数后点击「运行回测」查看策略表现。")
+
+# ---------- 多股对比 ----------
+
+with tab_cmp:
+    cmp_input = st.text_input("输入多只股票代码（逗号分隔）", value=f"{symbol}, 000001, 300750")
+    if st.button("📊 开始对比"):
+        codes = []
+        for c in cmp_input.replace("，", ",").split(","):
+            c = c.strip()
+            if c:
+                try:
+                    codes.append(data_mod.normalize_symbol(c))
+                except ValueError:
+                    st.warning(f"已忽略无效代码：{c}")
+        codes = list(dict.fromkeys(codes))[:6]
+        if len(codes) < 2:
+            st.error("请至少输入 2 个有效代码")
+        else:
+            series, names, failed = {}, {}, []
+            with st.spinner("正在获取各股票行情…"):
+                for c in codes:
+                    try:
+                        d = load_history(c, years)
+                        series[c] = d.set_index("date")["close"]
+                        names[c] = load_name(c)
+                    except Exception:
+                        failed.append(c)
+            if failed:
+                st.warning(f"以下代码获取失败：{', '.join(failed)}")
+            if len(series) >= 2:
+                st.session_state["cmp_data"] = (series, names)
+
+    cmp_state = st.session_state.get("cmp_data")
+    if cmp_state:
+        series, names = cmp_state
+        aligned = pd.DataFrame(series).dropna()
+        norm = aligned / aligned.iloc[0] * 100
+
+        fig = go.Figure()
+        for c in norm.columns:
+            fig.add_scatter(x=norm.index, y=norm[c], name=f"{names[c]}({c})", line=dict(width=1.6))
+        fig.add_hline(y=100, line_dash="dot", line_color="gray")
+        fig.update_layout(
+            height=420, hovermode="x unified", legend=dict(orientation="h"),
+            margin=dict(t=30, b=10), yaxis_title="归一化价格（起点=100）",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        col_a, col_b = st.columns([1, 1])
+        with col_a:
+            st.markdown("**区间表现**")
+            rows = []
+            for c in aligned.columns:
+                s = aligned[c]
+                ret = s.iloc[-1] / s.iloc[0] - 1
+                dd = float((s / s.cummax() - 1).min())
+                vol = float(s.pct_change().std() * (252 ** 0.5))
+                rows.append({"股票": f"{names[c]}({c})", "区间涨跌": f"{ret * 100:+.1f}%", "年化波动": f"{vol * 100:.1f}%", "最大回撤": f"{dd * 100:.1f}%"})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        with col_b:
+            st.markdown("**日收益相关性**")
+            corr = aligned.pct_change().corr()
+            labels = [f"{names[c]}({c})" for c in corr.columns]
+            fig = go.Figure(
+                go.Heatmap(
+                    z=corr.values, x=labels, y=labels,
+                    colorscale="RdBu", zmin=-1, zmax=1, text=corr.round(2).values,
+                    texttemplate="%{text}",
+                )
+            )
+            # 标签可能是纯数字字符串，强制按分类轴处理，避免被当作数值坐标
+            fig.update_xaxes(type="category")
+            fig.update_yaxes(type="category")
+            fig.update_layout(height=320, margin=dict(t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+
+# ---------- 个股资讯 ----------
+
+with tab_news:
+    try:
+        with st.spinner("正在获取最新资讯…"):
+            news_df = load_news(symbol)
+        senti_counts = news_df["sentiment"].value_counts()
+        n1, n2, n3 = st.columns(3)
+        n1.metric("🔴 偏利好", int(senti_counts.get("偏利好", 0)))
+        n2.metric("⚪ 中性", int(senti_counts.get("中性", 0)))
+        n3.metric("🟢 偏利空", int(senti_counts.get("偏利空", 0)))
+
+        icon_map = {"偏利好": "🔴", "中性": "⚪", "偏利空": "🟢"}
+        for _, row in news_df.iterrows():
+            icon = icon_map.get(row["sentiment"], "⚪")
+            st.markdown(
+                f"{icon} **[{row['title']}]({row['url']})**  \n"
+                f"<span style='color:#8b97a7;font-size:13px'>{row['time']} · {row['source']} · {row['sentiment']}</span>",
+                unsafe_allow_html=True,
+            )
+        st.caption("情绪标注基于标题/正文关键词的简单规则，仅供参考。")
+    except Exception as e:
+        st.info(f"资讯获取暂不可用（{type(e).__name__}），不影响其他功能。")
