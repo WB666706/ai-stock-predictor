@@ -11,8 +11,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import warnings
+
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.ensemble import (
     GradientBoostingRegressor,
     RandomForestRegressor,
@@ -27,7 +30,12 @@ from sklearn.preprocessing import StandardScaler
 
 from . import indicators
 
+# lightgbm 在 numpy 输入下偶发的特征名校验提示，无实际影响
+warnings.filterwarnings("ignore", message="X does not have valid feature names")
+
 MODEL_CHOICES = {
+    "LightGBM (专业·推荐)": "lgbm",
+    "Stacking 堆叠融合 (专业)": "stack",
     "模型融合 (Ensemble)": "ensemble",
     "随机森林 (Random Forest)": "rf",
     "梯度提升树 (Gradient Boosting)": "gbdt",
@@ -36,7 +44,59 @@ MODEL_CHOICES = {
 }
 
 
+class TimeSeriesStackingRegressor(BaseEstimator, RegressorMixin):
+    """时序安全的两层 Stacking 融合。
+
+    sklearn 自带的 StackingRegressor 要求 CV 为完整分割（partition），与时序切分不兼容；
+    这里手工实现：元特征由 TimeSeriesSplit 的 out-of-fold 预测生成（训练永远在测试之前），
+    元学习器用 Ridge 学习各基模型的最优组合权重，全程无未来数据泄漏。
+    """
+
+    def __init__(self, kinds: tuple = ("lgbm", "gbdt", "rf"), n_splits: int = 3):
+        self.kinds = kinds
+        self.n_splits = n_splits
+
+    def fit(self, X, y):
+        X, y = np.asarray(X), np.asarray(y)
+        oof = np.full((len(y), len(self.kinds)), np.nan)
+        for tr, te in TimeSeriesSplit(n_splits=self.n_splits).split(X):
+            for j, kind in enumerate(self.kinds):
+                est = _make_estimator(kind)
+                est.fit(X[tr], y[tr])
+                oof[te, j] = est.predict(X[te])
+        mask = ~np.isnan(oof).any(axis=1)
+        self.meta_ = Ridge(alpha=1.0).fit(oof[mask], y[mask])
+        self.bases_ = [_make_estimator(k).fit(X, y) for k in self.kinds]
+        return self
+
+    def predict(self, X):
+        X = np.asarray(X)
+        meta_X = np.column_stack([b.predict(X) for b in self.bases_])
+        return self.meta_.predict(meta_X)
+
+
 def _make_estimator(kind: str):
+    if kind == "lgbm":
+        from lightgbm import LGBMRegressor
+
+        # 针对金融时序低信噪比场景的保守参数：浅树 + 强正则 + 低学习率
+        return LGBMRegressor(
+            n_estimators=400,
+            learning_rate=0.02,
+            num_leaves=15,
+            max_depth=4,
+            subsample=0.8,
+            subsample_freq=1,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            min_child_samples=20,
+            random_state=42,
+            n_jobs=-1,
+            verbosity=-1,
+        )
+    if kind == "stack":
+        return TimeSeriesStackingRegressor()
     if kind == "rf":
         return RandomForestRegressor(
             n_estimators=300, max_depth=6, min_samples_leaf=5, n_jobs=-1, random_state=42
@@ -63,31 +123,102 @@ def _make_model(kind: str) -> Pipeline:
     return make_pipeline(StandardScaler(), _make_estimator(kind))
 
 
+# 大盘指数缓存（进程级），保证同一会话内特征列一致
+_MARKET_CACHE: dict = {}
+
+
+def _market_close(dates: pd.Series) -> pd.Series | None:
+    """返回与个股交易日对齐的上证指数收盘价序列；获取失败返回 None（特征自动降级）。"""
+    if "df" not in _MARKET_CACHE:
+        try:
+            from . import data as data_mod
+
+            _MARKET_CACHE["df"] = data_mod.fetch_index_history()
+        except Exception:
+            _MARKET_CACHE["df"] = None
+    idx = _MARKET_CACHE["df"]
+    if idx is None or idx.empty:
+        return None
+    s = idx.set_index("date")["close"]
+    aligned = s.reindex(pd.to_datetime(dates.values)).ffill()
+    aligned.index = dates.index
+    return aligned
+
+
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
-    """从 OHLCV 行情构造模型特征，返回包含特征列的 DataFrame。"""
+    """从 OHLCV 行情构造约 40 维量价/形态/市场因子，返回包含特征列的 DataFrame。"""
     df = indicators.add_all(df)
     out = pd.DataFrame(index=df.index)
-    close = df["close"]
+    close, high, low, open_, vol = df["close"], df["high"], df["low"], df["open"], df["volume"]
+    prev_close = close.shift(1)
+    ret1 = close.pct_change()
 
+    # ---- 动量 / 均线 ----
     for lag in (1, 2, 3, 5, 10, 20):
         out[f"ret_{lag}d"] = close.pct_change(lag)
-
     for w in (5, 10, 20, 60):
         out[f"close_ma{w}"] = close / df[f"ma{w}"] - 1
 
-    ret1 = close.pct_change()
+    # ---- 波动率 ----
     out["vol_5d"] = ret1.rolling(5).std()
     out["vol_20d"] = ret1.rolling(20).std()
+    out["vol_ratio"] = out["vol_5d"] / out["vol_20d"] - 1  # 短/长期波动比（变盘信号）
+    tr = pd.concat(
+        [high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1
+    ).max(axis=1)
+    out["atr_14"] = tr.rolling(14).mean() / close
 
+    # ---- 经典振荡指标 ----
     out["rsi14"] = df["rsi14"] / 100
     out["macd_hist"] = df["macd_hist"] / close
     out["kdj_k"] = df["kdj_k"] / 100
     out["boll_pos"] = (close - df["boll_lower"]) / (df["boll_upper"] - df["boll_lower"])
+    tp = (high + low + close) / 3
+    out["cci_20"] = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std()) / 100
+    hh, ll = high.rolling(14).max(), low.rolling(14).min()
+    out["wr_14"] = (hh - close) / (hh - ll)
 
-    vol_ma5 = df["volume"].rolling(5).mean()
-    out["volume_ratio"] = df["volume"] / vol_ma5 - 1
-    out["amplitude"] = (df["high"] - df["low"]) / close.shift(1)
-    return out
+    # ---- 量能 ----
+    out["volume_ratio"] = vol / vol.rolling(5).mean() - 1
+    out["vol_trend"] = vol.rolling(5).mean() / vol.rolling(20).mean() - 1
+    obv = (np.sign(ret1.fillna(0)) * vol).cumsum()
+    out["obv_slope_10"] = (obv - obv.shift(10)) / vol.rolling(10).sum()
+    mf = tp * vol
+    pos_mf = mf.where(tp > tp.shift(1), 0.0).rolling(14).sum()
+    neg_mf = mf.where(tp < tp.shift(1), 0.0).rolling(14).sum()
+    out["mfi_14"] = pos_mf / (pos_mf + neg_mf)
+
+    # ---- 收益分布形态 ----
+    out["skew_20d"] = ret1.rolling(20).skew()
+    out["kurt_20d"] = ret1.rolling(20).kurt()
+
+    # ---- 价格位置（半年高低点） ----
+    out["pos_high_120"] = close / close.rolling(120, min_periods=60).max() - 1
+    out["pos_low_120"] = close / close.rolling(120, min_periods=60).min() - 1
+
+    # ---- K 线形态 ----
+    out["amplitude"] = (high - low) / prev_close
+    out["gap"] = open_ / prev_close - 1
+    out["body"] = (close - open_) / prev_close
+    rng = (high - low).replace(0, np.nan)
+    out["upper_shadow"] = (high - np.maximum(close, open_)) / rng
+    out["lower_shadow"] = (np.minimum(close, open_) - low) / rng
+
+    # ---- 日历效应 ----
+    out["dow"] = (pd.to_datetime(df["date"]).dt.dayofweek - 2) / 2
+
+    # ---- 大盘相对特征（上证指数）----
+    mkt = _market_close(df["date"])
+    if mkt is not None:
+        mret1 = mkt.pct_change()
+        out["mkt_ret_1d"] = mret1
+        out["mkt_ret_5d"] = mkt.pct_change(5)
+        out["mkt_ret_20d"] = mkt.pct_change(20)
+        out["mkt_corr_20d"] = ret1.rolling(20).corr(mret1)
+        out["beta_60d"] = ret1.rolling(60).cov(mret1) / mret1.rolling(60).var()
+        out["rel_strength_20d"] = close.pct_change(20) - mkt.pct_change(20)
+
+    return out.replace([np.inf, -np.inf], np.nan)
 
 
 @dataclass

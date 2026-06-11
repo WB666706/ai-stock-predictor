@@ -37,8 +37,14 @@ def run_backtest(
     retrain_every: int = 20,
     threshold: float = 0.0,
     cost: float = 0.001,
+    sizing: str = "binary",
 ) -> BacktestResult:
-    """对最近 test_size 个交易日做模型信号策略回测。"""
+    """对最近 test_size 个交易日做模型信号策略回测。
+
+    sizing:
+    - "binary": 预测为正则满仓、否则空仓
+    - "confidence": 置信度加权——仓位 = 预测收益 / 历史波动，预测越强仓位越高（0~100%）
+    """
     features = build_features(df)
     close = df["close"]
     target = close.shift(-1) / close - 1
@@ -53,15 +59,22 @@ def run_backtest(
     start0 = n - test_size
 
     preds = np.full(n, np.nan)
+    sigmas = np.full(n, np.nan)  # 截至训练时点的历史日收益波动（用于置信度归一化）
     for s in range(start0, n, retrain_every):
         m = _make_model(model_kind)
         m.fit(X[:s], y[:s])
         e = min(s + retrain_every, n)
         preds[s:e] = m.predict(X[s:e])
+        sigmas[s:e] = np.std(y[:s])
 
     pred_test = preds[start0:]
     ret_test = y[start0:]  # 持仓当日实际获得的次日收益
-    position = (pred_test > threshold).astype(float)
+
+    if sizing == "confidence":
+        position = np.clip(pred_test / (1.5 * sigmas[start0:]), 0.0, 1.0)
+        position[pred_test <= threshold] = 0.0
+    else:
+        position = (pred_test > threshold).astype(float)
 
     # 换仓成本：position 变化的当日按单边费率扣除
     switches = np.abs(np.diff(position, prepend=0.0))
@@ -73,8 +86,8 @@ def run_backtest(
     idx = data.index.to_numpy()[start0:]
     dates = df["date"].to_numpy()[idx + 1]  # 收益在次日实现
 
-    holding_days = int(position.sum())
-    win_days = int(np.sum((ret_test > 0) & (position == 1)))
+    holding_days = int(np.sum(position > 0))
+    win_days = int(np.sum((ret_test > 0) & (position > 0)))
     years_frac = test_size / 252
 
     def _annual(eq: np.ndarray) -> float:

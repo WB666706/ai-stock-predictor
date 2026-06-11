@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
+from core import advanced as adv_mod
 from core import backtest as bt_mod
 from core import data as data_mod
 from core import indicators, news as news_mod
@@ -80,12 +81,22 @@ def run_forecast(df: pd.DataFrame, horizon: int, kind: str):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def run_replay(df: pd.DataFrame, kind: str) -> pd.DataFrame:
-    return model_mod.walk_forward_replay(df, model_kind=kind)
+    # Stacking 单次训练成本高（内部含 12 次基模型拟合），降低重训频率
+    retrain = 30 if kind == "stack" else 10
+    return model_mod.walk_forward_replay(df, model_kind=kind, retrain_every=retrain)
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def run_backtest(df: pd.DataFrame, kind: str, threshold: float, cost: float):
-    return bt_mod.run_backtest(df, model_kind=kind, threshold=threshold, cost=cost)
+def run_backtest(df: pd.DataFrame, kind: str, threshold: float, cost: float, sizing: str):
+    retrain = 60 if kind == "stack" else 20
+    return bt_mod.run_backtest(
+        df, model_kind=kind, threshold=threshold, cost=cost, sizing=sizing, retrain_every=retrain
+    )
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def run_pro_eval(df: pd.DataFrame, kind: str):
+    return adv_mod.professional_eval(df, model_kind=kind)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
@@ -387,6 +398,55 @@ with tab_ai:
         except Exception as e:
             st.warning(f"滚动回放失败：{e}")
 
+    st.markdown("---")
+    st.markdown("**🎓 专业信号评估：Purged 交叉验证 · IC / RankIC / 分位数分析 · 方向概率**")
+    eval_kind = "lgbm" if is_deep else model_kind
+    eval_note = "（深度模型的信号评估采用 LightGBM 代理）" if is_deep else ""
+    st.caption(
+        f"采用专业量化机构的标准评估体系{eval_note}：训练/测试集之间留出 5 日 embargo 空窗防泄漏；"
+        "IC > 0.03 即认为信号有效，分位数收益单调递增说明信号区分度强。"
+    )
+    try:
+        with st.spinner("正在进行 Purged 交叉验证评估…"):
+            pe = run_pro_eval(df, eval_kind)
+
+        e1, e2, e3, e4, e5 = st.columns(5)
+        e1.metric("IC（信息系数）", f"{pe.ic:.4f}", "有效 ≥ 0.03" if pe.ic >= 0.03 else "偏弱 < 0.03", delta_color="off")
+        e2.metric("RankIC", f"{pe.rank_ic:.4f}")
+        e3.metric("ICIR（稳定性）", f"{pe.icir:.2f}")
+        e4.metric("方向 AUC", f"{pe.direction_auc:.3f}", "随机=0.500", delta_color="off")
+        prob_color = "🔴" if pe.prob_up >= 0.55 else ("🟢" if pe.prob_up <= 0.45 else "⚪")
+        e5.metric(f"{prob_color} 次日上涨概率", f"{pe.prob_up * 100:.1f}%")
+
+        q1, q2 = st.columns([1.2, 1])
+        with q1:
+            qt = pe.quantile_table
+            colors = [UP if v >= 0 else DOWN for v in qt["平均实际收益"]]
+            fig = go.Figure(
+                go.Bar(
+                    x=qt["分位"], y=qt["平均实际收益"] * 100,
+                    marker_color=colors,
+                    text=[f"{v * 100:+.3f}%" for v in qt["平均实际收益"]],
+                    textposition="outside",
+                )
+            )
+            fig.update_layout(
+                height=320, margin=dict(t=30, b=10),
+                yaxis_title="实际平均次日收益 %", title="预测分位 vs 实际收益（应单调递增）",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        with q2:
+            show_qt = qt.copy()
+            show_qt["平均实际收益"] = (show_qt["平均实际收益"] * 100).map("{:+.3f}%".format)
+            show_qt["胜率"] = (show_qt["胜率"] * 100).map("{:.1f}%".format)
+            st.dataframe(show_qt, use_container_width=True, hide_index=True)
+            st.caption(
+                f"基于 {pe.n_samples} 个 out-of-fold 样本。Q5（最看多组）收益显著高于 Q1（最看空组）"
+                "说明模型确实捕捉到了有效信号，而非随机噪声。"
+            )
+    except Exception as e:
+        st.warning(f"专业评估暂不可用：{e}")
+
     st.warning(
         "📢 **免责声明**：以上预测基于历史技术面数据的统计规律，无法预知突发消息、政策与基本面变化。"
         "股价短期走势接近随机游走，任何模型的预测都存在很大不确定性。"
@@ -400,16 +460,21 @@ with tab_bt:
     if is_deep:
         st.info("策略回测需要逐段重训模型，深度模型成本过高，此处自动改用「岭回归」信号回测。")
     bt_kind = "ridge" if is_deep else model_kind
-    p1, p2, p3 = st.columns(3)
+    p1, p2, p3, p4 = st.columns(4)
     threshold = p1.number_input("开仓阈值（预测次日收益 >）", value=0.0, step=0.001, format="%.3f")
     cost = p2.number_input("单边交易成本", value=0.001, step=0.0005, format="%.4f", help="含佣金与冲击成本，0.001 = 0.1%")
-    p3.markdown(" ")
-    do_bt = p3.button("🚀 运行回测（最近一年）", use_container_width=True)
+    sizing_label = p3.selectbox(
+        "仓位方式", ["二元（满仓/空仓）", "置信度加权（0~100%）"],
+        help="置信度加权：仓位与预测强度成正比，模型把握越大仓位越高，能显著降低回撤",
+    )
+    sizing = "confidence" if sizing_label.startswith("置信度") else "binary"
+    p4.markdown(" ")
+    do_bt = p4.button("🚀 运行回测（最近一年）", use_container_width=True)
 
     if do_bt:
         try:
             with st.spinner("正在滚动训练并回测（约 10-60 秒）…"):
-                st.session_state["bt_result"] = run_backtest(df, bt_kind, threshold, cost)
+                st.session_state["bt_result"] = run_backtest(df, bt_kind, threshold, cost, sizing)
         except Exception as e:
             st.error(f"回测失败：{e}")
 
@@ -428,7 +493,7 @@ with tab_bt:
         fig.add_scatter(x=eq["date"], y=(eq["strategy"] - 1) * 100, name="模型信号策略", line=dict(color=GOLD, width=2), row=1, col=1)
         fig.add_scatter(x=eq["date"], y=(eq["buy_hold"] - 1) * 100, name="买入持有", line=dict(color="#42a5f5", width=1.6), row=1, col=1)
         fig.add_scatter(
-            x=eq["date"], y=eq["position"], name="仓位（1=持仓）",
+            x=eq["date"], y=eq["position"], name="仓位（0~1）",
             line=dict(color=ACCENT, width=1), fill="tozeroy", fillcolor="rgba(108,140,255,0.18)", row=2, col=1,
         )
         fig.update_yaxes(title_text="累计收益 %", row=1, col=1)

@@ -119,6 +119,65 @@ def fetch_history(symbol: str, years: int = 3, adjust: str = "qfq") -> pd.DataFr
     return df
 
 
+def _index_df(rows: list[tuple]) -> pd.DataFrame:
+    df = pd.DataFrame(rows, columns=["date", "close"])
+    df["date"] = pd.to_datetime(df["date"])
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    return (
+        df.dropna()
+        .drop_duplicates(subset="date")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+
+def fetch_index_history(symbol: str = "000001", years: int = 9) -> pd.DataFrame:
+    """获取大盘指数日线收盘价（默认上证指数），用于构造市场相对强度 / Beta 特征。
+
+    直连东方财富 K 线接口（akshare 的指数接口需先拉全量指数列表，慢且易断连），
+    失败时切换腾讯备用源。
+    """
+    end = dt.date.today()
+    start = end - dt.timedelta(days=int(years * 365.25))
+
+    for attempt in range(2):
+        try:
+            r = requests.get(
+                "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                params={
+                    "secid": f"1.{symbol}",
+                    "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f53",  # 日期、收盘
+                    "klt": "101",
+                    "fqt": "1",
+                    "beg": start.strftime("%Y%m%d"),
+                    "end": "20500101",
+                },
+                timeout=10,
+            )
+            klines = (r.json().get("data") or {}).get("klines") or []
+            if klines:
+                return _index_df([tuple(k.split(",")) for k in klines])
+        except (requests.exceptions.RequestException, ConnectionError, ValueError):
+            time.sleep(1)
+
+    # 腾讯接口单次最多约 640 条，按 880 个自然日（约 600 个交易日）分窗拉取
+    rows: list[tuple] = []
+    cur = start
+    while cur <= end:
+        win_end = min(cur + dt.timedelta(days=880), end)
+        r = requests.get(
+            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+            params={"param": f"sh{symbol},day,{cur:%Y-%m-%d},{win_end:%Y-%m-%d},640,qfq"},
+            timeout=10,
+        )
+        payload = (r.json().get("data") or {}).get(f"sh{symbol}") or {}
+        klines = payload.get("qfqday") or payload.get("day") or []
+        rows.extend((k[0], k[2]) for k in klines)
+        cur = win_end + dt.timedelta(days=1)
+    return _index_df(rows)
+
+
 def fetch_stock_name(symbol: str) -> str:
     """获取股票名称，东财失败时改用腾讯行情接口，再失败返回代码本身。"""
     symbol = normalize_symbol(symbol)
