@@ -15,6 +15,14 @@ from core import data as data_mod
 from core import indicators, news as news_mod
 from core import model as model_mod
 from core import signals as signals_mod
+from core import watchlist as wl_mod
+
+# 深度学习模型标签（torch 较重，core.deep 延迟到实际使用时再导入）
+DEEP_CHOICES = {
+    "LSTM (深度学习)": "lstm",
+    "Transformer (深度学习)": "transformer",
+}
+ALL_MODEL_CHOICES = {**model_mod.MODEL_CHOICES, **DEEP_CHOICES}
 
 st.set_page_config(page_title="AI 股票预测 Pro", page_icon="📈", layout="wide")
 
@@ -63,6 +71,10 @@ def load_name(symbol: str) -> str:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def run_forecast(df: pd.DataFrame, horizon: int, kind: str):
+    if kind in DEEP_CHOICES.values():
+        from core import deep
+
+        return deep.train_and_forecast_deep(df, horizon=horizon, model_kind=kind)
     return model_mod.train_and_forecast(df, horizon=horizon, model_kind=kind)
 
 
@@ -88,7 +100,7 @@ with st.sidebar:
     symbol_input = st.text_input("股票代码", value="600519", help="6 位 A 股代码，如 600519（贵州茅台）、000001（平安银行）")
     years = st.select_slider("历史数据范围（年）", options=[1, 2, 3, 5, 8], value=3)
     horizon = st.slider("预测天数（交易日）", min_value=3, max_value=30, value=10)
-    model_label = st.selectbox("预测模型", list(model_mod.MODEL_CHOICES))
+    model_label = st.selectbox("预测模型", list(ALL_MODEL_CHOICES))
     run = st.button("开始分析", type="primary", use_container_width=True)
 
     st.divider()
@@ -119,7 +131,8 @@ name: str = st.session_state["name"]
 symbol: str = st.session_state["symbol"]
 horizon = st.session_state["horizon"]
 model_label = st.session_state["model_label"]
-model_kind = model_mod.MODEL_CHOICES[model_label]
+model_kind = ALL_MODEL_CHOICES[model_label]
+is_deep = model_kind in DEEP_CHOICES.values()
 
 dfi = indicators.add_all(df)
 
@@ -137,8 +150,8 @@ c4.metric("区间最高", f"{df['high'].max():.2f}")
 c5.metric("区间最低", f"{df['low'].min():.2f}")
 st.caption(f"数据范围：{df['date'].iloc[0]:%Y-%m-%d} ～ {df['date'].iloc[-1]:%Y-%m-%d}，前复权日线，共 {len(df)} 个交易日")
 
-tab_k, tab_ind, tab_diag, tab_ai, tab_bt, tab_cmp, tab_news = st.tabs(
-    ["🕯️ K 线与均线", "📊 技术指标", "🧭 智能诊断", "🤖 AI 预测", "⚖️ 策略回测", "🆚 多股对比", "📰 个股资讯"]
+tab_k, tab_ind, tab_diag, tab_ai, tab_bt, tab_cmp, tab_wl, tab_news = st.tabs(
+    ["🕯️ K 线与均线", "📊 技术指标", "🧭 智能诊断", "🤖 AI 预测", "⚖️ 策略回测", "🆚 多股对比", "⭐ 自选股监控", "📰 个股资讯"]
 )
 
 # ---------- K 线 ----------
@@ -348,24 +361,31 @@ with tab_ai:
     st.markdown("---")
     st.markdown("**🔁 模型可信度检验：历史预测 vs 实际走势（滚动回放）**")
     st.caption("模拟「每天只用当天之前的数据训练模型」，逐日预测次日收盘价并与实际对比——这是模型真实水平的试金石。")
-    try:
-        with st.spinner("正在滚动回放历史预测…"):
-            replay = run_replay(df, model_kind)
-        hit = float((replay["pred_ret"] * replay["actual_ret"] > 0).mean())
-        r1, r2 = st.columns([3, 1])
-        with r1:
-            fig = go.Figure()
-            fig.add_scatter(x=replay["date"], y=replay["actual"], name="实际收盘价", line=dict(color="#42a5f5", width=1.6))
-            fig.add_scatter(x=replay["date"], y=replay["predicted"], name="当日模型预测", line=dict(color=GOLD, width=1.4, dash="dot"))
-            fig.update_layout(height=360, hovermode="x unified", legend=dict(orientation="h"), margin=dict(t=20, b=10))
-            st.plotly_chart(fig, use_container_width=True)
-        with r2:
-            st.metric("回放区间方向命中率", f"{hit * 100:.1f}%")
-            st.metric("回放天数", f"{len(replay)}")
-            mae_replay = float((replay["pred_ret"] - replay["actual_ret"]).abs().mean())
-            st.metric("收益率 MAE", f"{mae_replay * 100:.2f}%")
-    except Exception as e:
-        st.warning(f"滚动回放失败：{e}")
+    if is_deep:
+        ex = result.extra or {}
+        st.info(
+            f"深度模型采用「时间留出验证」替代滚动回放（逐日重训成本过高）：以最近 {ex.get('val_size', '-')} 条序列为验证集，"
+            f"上方方向准确率即验证集真实表现（训练 {ex.get('epochs', '-')} 轮，早停选优）。"
+        )
+    else:
+        try:
+            with st.spinner("正在滚动回放历史预测…"):
+                replay = run_replay(df, model_kind)
+            hit = float((replay["pred_ret"] * replay["actual_ret"] > 0).mean())
+            r1, r2 = st.columns([3, 1])
+            with r1:
+                fig = go.Figure()
+                fig.add_scatter(x=replay["date"], y=replay["actual"], name="实际收盘价", line=dict(color="#42a5f5", width=1.6))
+                fig.add_scatter(x=replay["date"], y=replay["predicted"], name="当日模型预测", line=dict(color=GOLD, width=1.4, dash="dot"))
+                fig.update_layout(height=360, hovermode="x unified", legend=dict(orientation="h"), margin=dict(t=20, b=10))
+                st.plotly_chart(fig, use_container_width=True)
+            with r2:
+                st.metric("回放区间方向命中率", f"{hit * 100:.1f}%")
+                st.metric("回放天数", f"{len(replay)}")
+                mae_replay = float((replay["pred_ret"] - replay["actual_ret"]).abs().mean())
+                st.metric("收益率 MAE", f"{mae_replay * 100:.2f}%")
+        except Exception as e:
+            st.warning(f"滚动回放失败：{e}")
 
     st.warning(
         "📢 **免责声明**：以上预测基于历史技术面数据的统计规律，无法预知突发消息、政策与基本面变化。"
@@ -377,6 +397,9 @@ with tab_ai:
 
 with tab_bt:
     st.markdown("**模型信号策略**：滚动训练（不使用未来数据），预测次日收益为正则持仓、否则空仓，与「买入持有」对比。")
+    if is_deep:
+        st.info("策略回测需要逐段重训模型，深度模型成本过高，此处自动改用「岭回归」信号回测。")
+    bt_kind = "ridge" if is_deep else model_kind
     p1, p2, p3 = st.columns(3)
     threshold = p1.number_input("开仓阈值（预测次日收益 >）", value=0.0, step=0.001, format="%.3f")
     cost = p2.number_input("单边交易成本", value=0.001, step=0.0005, format="%.4f", help="含佣金与冲击成本，0.001 = 0.1%")
@@ -386,7 +409,7 @@ with tab_bt:
     if do_bt:
         try:
             with st.spinner("正在滚动训练并回测（约 10-60 秒）…"):
-                st.session_state["bt_result"] = run_backtest(df, model_kind, threshold, cost)
+                st.session_state["bt_result"] = run_backtest(df, bt_kind, threshold, cost)
         except Exception as e:
             st.error(f"回测失败：{e}")
 
@@ -490,6 +513,69 @@ with tab_cmp:
             fig.update_yaxes(type="category")
             fig.update_layout(height=320, margin=dict(t=10, b=10))
             st.plotly_chart(fig, use_container_width=True)
+
+# ---------- 自选股监控 ----------
+
+with tab_wl:
+    codes = wl_mod.load_watchlist()
+
+    col_add, col_del, col_run = st.columns([1.2, 1.2, 1])
+    with col_add:
+        new_code = st.text_input("添加自选股", placeholder="输入 6 位代码，如 601318", key="wl_add")
+        if st.button("➕ 添加") and new_code.strip():
+            try:
+                codes = wl_mod.add_stock(new_code)
+                st.success(f"已添加 {wl_mod.data_mod.normalize_symbol(new_code)}")
+                st.rerun()
+            except ValueError as e:
+                st.error(str(e))
+    with col_del:
+        del_code = st.selectbox("移除自选股", ["（选择代码）", *codes], key="wl_del")
+        if st.button("🗑️ 移除") and del_code in codes:
+            wl_mod.remove_stock(del_code)
+            st.rerun()
+    with col_run:
+        st.markdown(" ")
+        st.markdown(" ")
+        do_inspect = st.button("🔍 一键巡检", type="primary", use_container_width=True)
+
+    st.caption(f"当前自选股（{len(codes)} 只）：{'、'.join(codes)}")
+
+    if do_inspect:
+        with st.spinner(f"正在巡检 {len(codes)} 只股票（每只约 5-10 秒）…"):
+            st.session_state["wl_report"] = wl_mod.inspect_all(codes)
+
+    report = st.session_state.get("wl_report")
+    if report is not None:
+        ok = report[report["诊断评分"].notna()]
+        s1, s2, s3 = st.columns(3)
+        s1.metric("🔴 AI 看多", int((ok["AI信号"] == "看多").sum()))
+        s2.metric("🟢 AI 看空", int((ok["AI信号"] == "看空").sum()))
+        s3.metric("平均诊断评分", f"{ok['诊断评分'].mean():.0f} 分" if not ok.empty else "-")
+
+        st.dataframe(report, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ 导出巡检报告 CSV",
+            report.to_csv(index=False).encode("utf-8-sig"),
+            file_name="watchlist_report.csv",
+            mime="text/csv",
+        )
+        st.caption("AI 次日预测来自岭回归快速模型（horizon=1）；详细分析请在左侧输入单只代码查看。")
+
+    with st.expander("⏰ 设置每日定时自动预测（Windows 计划任务）"):
+        st.markdown(
+            "项目自带 `daily_report.py`，每天收盘后自动巡检自选股并把报告保存到 `reports/` 目录。\n\n"
+            "在 PowerShell（管理员）中运行以下命令，即可注册每个交易日 15:30 自动执行：\n"
+        )
+        import sys as _sys
+
+        task_cmd = (
+            f'schtasks /Create /TN "AI股票每日预测" /SC WEEKLY /D MON,TUE,WED,THU,FRI /ST 15:30 '
+            f'/TR "cmd /c cd /d \\"{wl_mod.os.path.dirname(wl_mod.os.path.abspath(wl_mod.__file__))}\\\\..\\" '
+            f'&& \\"{_sys.executable}\\" daily_report.py"'
+        )
+        st.code(task_cmd, language="powershell")
+        st.markdown("取消任务：`schtasks /Delete /TN \"AI股票每日预测\" /F`")
 
 # ---------- 个股资讯 ----------
 

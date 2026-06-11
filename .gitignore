@@ -1,5 +1,7 @@
 __pycache__/
 *.pyc
+watchlist.json
+reports/
 .venv/
 venv/
 .streamlit/secrets.toml
