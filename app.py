@@ -15,6 +15,7 @@ from core import backtest as bt_mod
 from core import data as data_mod
 from core import indicators, news as news_mod
 from core import model as model_mod
+from core import screener as scr_mod
 from core import signals as signals_mod
 from core import watchlist as wl_mod
 
@@ -161,8 +162,8 @@ c4.metric("区间最高", f"{df['high'].max():.2f}")
 c5.metric("区间最低", f"{df['low'].min():.2f}")
 st.caption(f"数据范围：{df['date'].iloc[0]:%Y-%m-%d} ～ {df['date'].iloc[-1]:%Y-%m-%d}，前复权日线，共 {len(df)} 个交易日")
 
-tab_k, tab_ind, tab_diag, tab_ai, tab_bt, tab_cmp, tab_wl, tab_news = st.tabs(
-    ["🕯️ K 线与均线", "📊 技术指标", "🧭 智能诊断", "🤖 AI 预测", "⚖️ 策略回测", "🆚 多股对比", "⭐ 自选股监控", "📰 个股资讯"]
+tab_k, tab_ind, tab_diag, tab_ai, tab_bt, tab_scr, tab_cmp, tab_wl, tab_news = st.tabs(
+    ["🕯️ K 线与均线", "📊 技术指标", "🧭 智能诊断", "🤖 AI 预测", "⚖️ 策略回测", "🎯 智能选股", "🆚 多股对比", "⭐ 自选股监控", "📰 个股资讯"]
 )
 
 # ---------- K 线 ----------
@@ -503,6 +504,83 @@ with tab_bt:
         st.caption("回测期为最近约 250 个交易日；每 20 个交易日用截至当日的数据重新训练模型，全程无未来数据泄漏。")
     else:
         st.info("设置参数后点击「运行回测」查看策略表现。")
+
+# ---------- 智能选股 ----------
+
+with tab_scr:
+    st.markdown(
+        "**两阶段漏斗选股**：全市场约 5000 只股票 → 快照粗筛（剔除 ST/停牌/小市值/低流动性，"
+        "按 60 日动量与资金活跃度保留候选池）→ **横截面 LightGBM 精排**"
+        "（用全部候选股约 1.5 年的 40 维因子面板训练「未来 5 日收益」模型，"
+        "样本量是单股模型的数百倍）→ 综合 AI 预测收益、动量、技术诊断评分输出最终排名。"
+    )
+
+    s1, s2, s3, s4 = st.columns(4)
+    pool_size = s1.selectbox("候选池规模（粗筛保留）", [200, 300, 500], index=1)
+    top_k = s2.selectbox("最终选出数量", [50, 100], index=1)
+    min_cap = s3.number_input("最小总市值（亿元）", value=30, step=10, min_value=10)
+    boards = s4.multiselect("排除板块", ["创业板", "科创板", "北交所"], default=["北交所"])
+
+    do_screen = st.button("🎯 开始全市场选股（约 1-3 分钟）", type="primary")
+
+    if do_screen:
+        prog = st.progress(0.0, text="正在获取全市场快照（约 10-30 秒）…")
+        try:
+            spot = scr_mod.fetch_market_snapshot()
+            prog.progress(0.08, text=f"快照完成（{len(spot)} 只），粗筛中…")
+            cand = scr_mod.coarse_screen(
+                spot, pool_size=pool_size, min_cap_yi=float(min_cap), exclude_boards=tuple(boards)
+            )
+
+            def _cb(done, total, stage):
+                if stage == "拉取行情":
+                    frac = 0.08 + 0.52 * done / total
+                elif stage == "构造因子":
+                    frac = 0.60 + 0.30 * done / total
+                elif stage == "训练横截面模型":
+                    frac = 0.92
+                else:
+                    frac = 1.0
+                prog.progress(min(frac, 1.0), text=f"{stage}（{done}/{total}）…")
+
+            res = scr_mod.fine_rank(cand, top_k=top_k, progress=_cb)
+            prog.empty()
+            st.session_state["scr_result"] = (res, len(spot))
+        except Exception as e:
+            prog.empty()
+            st.error(f"选股失败：{e}")
+
+    scr_state = st.session_state.get("scr_result")
+    if scr_state:
+        res, n_spot = scr_state
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("全市场扫描", f"{n_spot} 只")
+        g2.metric("粗筛候选", f"{res.n_candidates} 只")
+        g3.metric("完成精排", f"{res.n_ok} 只", f"失败 {len(res.failed)}", delta_color="off")
+        g4.metric("横截面训练样本", f"{res.train_samples:,}")
+
+        show = res.table.copy()
+        for col in ("20日涨跌", "60日涨跌", "AI预测5日收益"):
+            show[col] = (show[col] * 100).map(lambda v: f"{v:+.1f}%" if pd.notna(v) else "-")
+        show["综合得分"] = show["综合得分"].map("{:.1f}".format)
+        show["最新价"] = show["最新价"].map("{:.2f}".format)
+        st.dataframe(show, use_container_width=True, hide_index=True, height=600)
+
+        st.download_button(
+            "⬇️ 导出选股结果 CSV",
+            show.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"top{len(show)}_picks.csv",
+            mime="text/csv",
+        )
+        st.caption(
+            "综合得分 = 50% AI 预测收益排名 + 25% 动量排名 + 25% 技术诊断分。"
+            "可将感兴趣的代码输入左侧进行单股深度分析，或加入自选股监控。"
+        )
+
+    st.warning(
+        "📢 **重要提示**：选股基于历史量价统计规律，市场存在突发消息、政策等模型无法预知的因素，"
+        "任何选股系统都无法保证未来上涨。结果仅供学习参考，切勿直接作为投资依据。"
+    )
 
 # ---------- 多股对比 ----------
 

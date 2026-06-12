@@ -84,18 +84,25 @@ def _fetch_tencent(symbol: str, start: str, end: str, adjust: str) -> pd.DataFra
     return df.rename(columns={"amount": "volume"})
 
 
-def fetch_history(symbol: str, years: int = 3, adjust: str = "qfq") -> pd.DataFrame:
+def fetch_history(
+    symbol: str, years: float = 3, adjust: str = "qfq", prefer_tencent: bool = False
+) -> pd.DataFrame:
     """获取指定股票最近 N 年的日线历史行情（默认前复权）。
 
-    优先使用东方财富源（字段更全），连接失败时自动切换到腾讯源。
+    默认优先东方财富源（字段更全），连接失败时自动切换到腾讯源；
+    批量场景（如全市场选股）可设 prefer_tencent=True，腾讯接口更快更稳。
     """
     symbol = normalize_symbol(symbol)
     end = dt.date.today()
     start = end - dt.timedelta(days=int(years * 365.25))
     start_s, end_s = start.strftime("%Y%m%d"), end.strftime("%Y%m%d")
 
+    sources = [("东方财富", _fetch_eastmoney), ("腾讯", _fetch_tencent)]
+    if prefer_tencent:
+        sources.reverse()
+
     df, errors = None, []
-    for name, fetcher in (("东方财富", _fetch_eastmoney), ("腾讯", _fetch_tencent)):
+    for name, fetcher in sources:
         for attempt in range(2):
             try:
                 df = fetcher(symbol, start_s, end_s, adjust)
@@ -176,6 +183,93 @@ def fetch_index_history(symbol: str = "000001", years: int = 9) -> pd.DataFrame:
         rows.extend((k[0], k[2]) for k in klines)
         cur = win_end + dt.timedelta(days=1)
     return _index_df(rows)
+
+
+_SPOT_FIELDS = {
+    "f12": "代码",
+    "f14": "名称",
+    "f2": "最新价",
+    "f3": "涨跌幅",
+    "f6": "成交额",
+    "f8": "换手率",
+    "f10": "量比",
+    "f20": "总市值",
+    "f24": "60日涨跌幅",
+}
+
+
+def fetch_spot_fast(max_workers: int = 8) -> pd.DataFrame:
+    """全市场 A 股实时快照（直连东财 clist 接口，并行分页，约 10 秒）。
+
+    返回列：代码、名称、最新价、涨跌幅、成交额、换手率、量比、总市值、60日涨跌幅。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    base_params = {
+        "po": "1", "np": "1", "fltt": "2", "invt": "2", "fid": "f3",
+        "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+        "fields": ",".join(_SPOT_FIELDS),
+        "pz": "100",
+    }
+
+    def _page(pn: int) -> list[dict]:
+        r = requests.get(
+            "https://push2.eastmoney.com/api/qt/clist/get",
+            params={**base_params, "pn": str(pn)},
+            timeout=15,
+        )
+        return ((r.json().get("data") or {}).get("diff")) or []
+
+    first = requests.get(
+        "https://push2.eastmoney.com/api/qt/clist/get",
+        params={**base_params, "pn": "1"},
+        timeout=15,
+    ).json()
+    total = (first.get("data") or {}).get("total") or 0
+    if total < 1000:
+        raise ConnectionError("东财快照接口返回异常")
+    rows = list((first["data"].get("diff")) or [])
+
+    n_pages = -(-total // 100)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        for page_rows in pool.map(_page, range(2, n_pages + 1)):
+            rows.extend(page_rows)
+
+    df = pd.DataFrame(rows).rename(columns=_SPOT_FIELDS)
+    for c in df.columns:
+        if c not in ("代码", "名称"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.drop_duplicates(subset="代码").reset_index(drop=True)
+
+
+def fetch_history_fast(symbol: str, years: float = 1.5) -> pd.DataFrame:
+    """单只股票日线快速获取（直连腾讯 fqkline，单请求约 0.3-1 秒，最多 640 根）。
+
+    返回列：date / open / close / high / low / volume（前复权），适合批量选股场景。
+    """
+    symbol = normalize_symbol(symbol)
+    end = dt.date.today()
+    start = end - dt.timedelta(days=int(years * 365.25))
+    full = f"{market_prefix(symbol)}{symbol}"
+
+    r = requests.get(
+        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+        params={"param": f"{full},day,{start:%Y-%m-%d},{end:%Y-%m-%d},640,qfq"},
+        timeout=10,
+    )
+    payload = (r.json().get("data") or {}).get(full) or {}
+    klines = payload.get("qfqday") or payload.get("day") or []
+    if not klines:
+        raise ValueError(f"未获取到 {symbol} 的行情数据")
+
+    df = pd.DataFrame(
+        [k[:6] for k in klines],
+        columns=["date", "open", "close", "high", "low", "volume"],
+    )
+    df["date"] = pd.to_datetime(df["date"])
+    for c in ("open", "close", "high", "low", "volume"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
 
 
 def fetch_stock_name(symbol: str) -> str:
